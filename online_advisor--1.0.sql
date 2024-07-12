@@ -2,7 +2,7 @@
 
 CREATE TYPE index_candidate as (n_filtered float8, n_called bigint, elapsed_sec float8, create_index text);
 
-CREATE FUNCTION propose_indexes(combine boolean default true)
+CREATE FUNCTION propose_indexes(combine boolean default true, reset boolean default false)
 RETURNS SETOF index_candidate
 AS 'MODULE_PATHNAME', 'propose_indexes'
 LANGUAGE C PARALLEL SAFE;

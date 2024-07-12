@@ -604,6 +604,7 @@ propose_indexes(PG_FUNCTION_ARGS)
 	FunctionCallContext *fctx;	/* User function context. */
 	HeapTuple	tuple;
 	bool 		combine = PG_ARGISNULL(0) ? true : PG_GETARG_BOOL(0);
+	bool 		reset = PG_ARGISNULL(1) ? false : PG_GETARG_BOOL(1);
 	size_t 		n_clauses;
 
 
@@ -629,6 +630,10 @@ propose_indexes(PG_FUNCTION_ARGS)
 			n_clauses = state->n_clauses;
 			fctx->clauses = (FilterClause*) palloc0(n_clauses*sizeof(FilterClause));
 			memcpy(fctx->clauses, state->filter_clauses, n_clauses*sizeof(FilterClause));
+			if (reset)
+			{
+				state->n_clauses = 0;
+			}
 			SpinLockRelease(&state->spinlock);
 
 			fctx->visited = (bool*)palloc0(n_clauses*sizeof(bool));
