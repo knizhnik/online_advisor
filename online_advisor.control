@@ -1,0 +1,4 @@
+comment = 'Online index advisor'
+default_version = '1.0'
+module_pathname = '$libdir/online_advisor'
+relocatable = true
