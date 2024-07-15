@@ -28,7 +28,11 @@ create database somedb;
 create extension online_advisor;
 create table t3(x integer, y integer);
 insert into t3 values (generate_series(1,10000),0);
-select * from t3 where x < 0;
+select * from t3 where x = 0 and y=0;
+select n_filtered,n_called,create_index from proposed_indexes;
+
+-- check that we do not suggest to create already existed index
+create index on t3(x,y);
 select n_filtered,n_called,create_index from proposed_indexes;
 
 

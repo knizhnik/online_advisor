@@ -70,14 +70,21 @@ create database somedb;
 create extension online_advisor;
 create table t3(x integer, y integer);
 insert into t3 values (generate_series(1,10000),0);
-select * from t3 where x < 0;
+select * from t3 where x = 0 and y=0;
  x | y 
 ---+---
 (0 rows)
 
 select n_filtered,n_called,create_index from proposed_indexes;
- n_filtered | n_called |         create_index         
-------------+----------+------------------------------
-       9999 |        1 | CREATE INDEX ON public.t3(x)
+ n_filtered | n_called |          create_index          
+------------+----------+--------------------------------
+      10000 |        1 | CREATE INDEX ON public.t3(x,y)
 (1 row)
+
+-- check that we do not suggest to create already existed index
+create index on t3(x,y);
+select n_filtered,n_called,create_index from proposed_indexes;
+ n_filtered | n_called | create_index 
+------------+----------+--------------
+(0 rows)
 

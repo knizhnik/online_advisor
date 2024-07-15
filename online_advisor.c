@@ -23,6 +23,7 @@
 #include "access/tableam.h"
 #include "commands/defrem.h"
 #include "executor/instrument.h"
+#include "executor/spi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/bitmapset.h"
@@ -579,6 +580,43 @@ compare_number_of_keys(void const* a, void const* b)
 	return fbms_num_members(&((FilterClause*)a)->key_set) - fbms_num_members(&((FilterClause*)b)->key_set);
 }
 
+static bool
+check_if_index_exists(Oid relid, FixedBitmapset const* keys)
+{
+	StringInfoData buf;
+	int attno  = -1;
+	char sep = '{';
+	bool found = false;
+	int rc;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "select relname from pg_class join pg_index on pg_class.oid=pg_index.indexrelid where indrelid=%d and '", relid);
+
+	while ((attno = fbms_next_member(keys, attno)) >= 0)
+	{
+		appendStringInfoChar(&buf, sep);
+		appendStringInfo(&buf, "%d", attno);
+		sep = ',';
+	}
+	appendStringInfoString(&buf, "}'::smallint[] <@ indkey::smallint[]");
+
+	SPI_connect();
+	rc = SPI_execute(buf.data, true, 0);
+	if (rc != SPI_OK_SELECT)
+	{
+		elog(LOG, "Select failed with status %d", rc);
+	}
+	else if (SPI_processed)
+	{
+		char* indname = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+		elog(LOG, "Index %s already exists", indname);
+		found = true;
+	}
+	SPI_finish();
+	pfree(buf.data);
+	return found;
+}
+
 /*
  * Context fot set-returning function
  */
@@ -668,6 +706,7 @@ propose_indexes(PG_FUNCTION_ARGS)
 			char sep = '(';
 			int attno  = -1;
 			FixedBitmapset* keys = &fctx->clauses[i].key_set;
+			size_t k = i;
 
 			initStringInfo(&buf);
 			appendStringInfo(&buf, "CREATE INDEX ON %s.%s",
@@ -684,7 +723,6 @@ propose_indexes(PG_FUNCTION_ARGS)
 			}
 			if (combine) /* find all clauses which can be handled by one compound index */
 			{
-				size_t k = i;
 				for (size_t j = i+1; j < n_clauses; j++) {
 					if (!fctx->visited[j] &&
 						relid == fctx->clauses[j].relid &&
@@ -712,6 +750,12 @@ propose_indexes(PG_FUNCTION_ARGS)
 					}
 				}
 			}
+			fctx->curpos = i+1;
+			if (check_if_index_exists(relid, &fctx->clauses[k].key_set))
+			{
+				pfree(buf.data);
+				continue;
+			}
 			appendStringInfoChar(&buf, ')');
 			values[0] = Float8GetDatum(state->filter_clauses[i].n_filtered);
 			values[1] = UInt64GetDatum(state->filter_clauses[i].n_calls);
@@ -722,7 +766,6 @@ propose_indexes(PG_FUNCTION_ARGS)
 			/* Build and return the tuple. */
 			tuple = heap_form_tuple(fctx->tupdesc, values, nulls);
 			result = HeapTupleGetDatum(tuple);
-			fctx->curpos = i+1;
 			SRF_RETURN_NEXT(funcctx, result);
 		}
 	}
