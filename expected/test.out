@@ -29,7 +29,7 @@ select count(*) from t where c1=1 and c3=1;
 select n_filtered,n_called,create_index from proposed_indexes;
  n_filtered | n_called |          create_index           
 ------------+----------+---------------------------------
-       8999 |        1 | CREATE INDEX ON public.t(c1,c2)
+      18998 |        2 | CREATE INDEX ON public.t(c1,c2)
        9999 |        1 | CREATE INDEX ON public.t(c1,c3)
 (2 rows)
 
@@ -44,7 +44,7 @@ select * from t where c1 in (select y from t2 where x = 1);
 select n_filtered,n_called,create_index from proposed_indexes;
  n_filtered | n_called |          create_index           
 ------------+----------+---------------------------------
-       8999 |        1 | CREATE INDEX ON public.t(c1,c2)
+      18998 |        2 | CREATE INDEX ON public.t(c1,c2)
        9999 |        1 | CREATE INDEX ON public.t2(x)
        9999 |        1 | CREATE INDEX ON public.t(c1,c3)
 (3 rows)
@@ -58,11 +58,27 @@ select * from t,t2 where c3=100 and y=200;
 select n_filtered,n_called,create_index from proposed_indexes;
  n_filtered | n_called |          create_index           
 ------------+----------+---------------------------------
-       8999 |        1 | CREATE INDEX ON public.t(c1,c2)
+      18998 |        2 | CREATE INDEX ON public.t(c1,c2)
        9999 |        1 | CREATE INDEX ON public.t2(x)
-       9999 |        1 | CREATE INDEX ON public.t(c3,c1)
-       9999 |        1 | CREATE INDEX ON public.t2(y)
+      19998 |        2 | CREATE INDEX ON public.t(c3,c1)
+      10000 |        1 | CREATE INDEX ON public.t2(y)
 (4 rows)
+
+-- check wrong estimation by not taken in account correlation between columns
+create table xyz(x integer, y integer, z integer);
+insert into xyz values (generate_series(1,100000)%100, generate_series(1,100000)%100, generate_series(1,100000)%100);
+vacuum analyze xyz;
+select count(*) from xyz where x=1 and y=1 and z=1;
+ count 
+-------
+  1000
+(1 row)
+
+select misestimation,n_called,create_statistics from proposed_statistics;
+ misestimation | n_called |             create_statistics              
+---------------+----------+--------------------------------------------
+          1000 |        1 | CREATE STATISTICS ON x,y,z FROM public.xyz
+(1 row)
 
 -- check work with multiple databases
 create database somedb;

@@ -22,6 +22,13 @@ select n_filtered,n_called,create_index from proposed_indexes;
 select * from t,t2 where c3=100 and y=200;
 select n_filtered,n_called,create_index from proposed_indexes;
 
+-- check wrong estimation by not taken in account correlation between columns
+create table xyz(x integer, y integer, z integer);
+insert into xyz values (generate_series(1,100000)%100, generate_series(1,100000)%100, generate_series(1,100000)%100);
+vacuum analyze xyz;
+select count(*) from xyz where x=1 and y=1 and z=1;
+select misestimation,n_called,create_statistics from proposed_statistics;
+
 -- check work with multiple databases
 create database somedb;
 \c somedb

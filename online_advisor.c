@@ -52,7 +52,9 @@ PG_MODULE_MAGIC;
 /* GUC variables */
 static bool do_instrumentation = false;
 static int  filtered_threshold = 1000;
-static int  max_indexes = 128;
+static int  max_proposals = 1000;
+static double misestimation_threshold = 10.0;
+static double min_rows = 1000;
 
 /* Saved hook values in case of unload */
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
@@ -169,7 +171,7 @@ fbms_num_members(const FixedBitmapset *a)
 typedef struct
 {
 	uint64			n_calls;    /* number of queries using such filter */
-	double			n_filtered; /* total number of filtered rows using subset of this key set */
+	double			agg;        /* aggregate value associated with this clause (number of filtered rows or maximal misestimation) */
 	double			elapsed;    /* total time in seconds spent in filtering this condfition */
 	Oid				dbid;       /* database identifier */
 	Oid				relid;      /* relation ID */
@@ -178,9 +180,15 @@ typedef struct
 
 typedef struct
 {
+	size_t          n_clauses;
+	FilterClause*   filter_clauses;
+} Proposal;
+
+typedef struct
+{
 	slock_t			spinlock; /* Spinlock to synchronize access */
-	size_t			n_clauses;
-	FilterClause	filter_clauses[FLEXIBLE_ARRAY_MEMBER];
+	Proposal        indexes;    /* index proposals */
+	Proposal        statistics; /* extended statistics proposals */
 } AdvisorState;
 
 AdvisorState* state;
@@ -191,7 +199,7 @@ static void advisor_ExecutorEnd(QueryDesc *queryDesc);
 static size_t
 advisor_shmem_size(void)
 {
-	return offsetof(AdvisorState, filter_clauses) + (size_t)max_indexes*sizeof(FilterClause);
+	return sizeof(AdvisorState) + max_proposals*2*sizeof(FilterClause);
 }
 
 static void
@@ -229,7 +237,10 @@ advisor_shmem_startup(void)
 							&found);
 	if (!found)
 	{
-		state->n_clauses = 0;
+		state->indexes.filter_clauses = (FilterClause*)(state + 1);
+		state->indexes.n_clauses = 0;
+		state->statistics.filter_clauses = state->indexes.filter_clauses + max_proposals;
+		state->statistics.n_clauses = 0;
 		SpinLockInit(&state->spinlock);
 	}
 	LWLockRelease(AddinShmemInitLock);
@@ -255,8 +266,8 @@ _PG_init(void)
 
 	/* Define custom GUC variables. */
 	DefineCustomIntVariable("online_advisor.filtered_threshold",
-							"Sets the minimum number of filtered records which triggers index suggestion.",
-							NULL,
+							"Minimum number of filtered records which triggers index suggestion.",
+							"Zero disdable this rule",
 							&filtered_threshold,
 							1000,
 							1, INT_MAX,
@@ -266,11 +277,11 @@ _PG_init(void)
 							NULL,
 							NULL);
 
-	DefineCustomIntVariable("online_advisor.max_indexes",
-							"Maximum number of indexes advisor can suggest.",
+	DefineCustomIntVariable("online_advisor.max_proposals",
+							"Maximal number of clauses which are tracked by online_advistor and so number of proposals to create indexes/extended statistics.",
 							NULL,
-							&max_indexes,
-							128,
+							&max_proposals,
+							1000,
 							1, INT_MAX,
 							PGC_POSTMASTER,
 							0,
@@ -289,6 +300,31 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
+	DefineCustomRealVariable("online_advisor.misestimation_threshold",
+							 "Threshold for actual/estimated #rows ratio triggering extended statistic suggestion.",
+							 "Zero disables this rule",
+							 &misestimation_threshold,
+							 10.0,
+							 0.0,
+							 INT_MAX,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomRealVariable("online_advisor.min_rows",
+							 "Minimal number of rows to check misestimation",
+							 "Zero disables this rule",
+							 &min_rows,
+							 1000.0,
+							 0.0,
+							 INT_MAX,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
 
 	MarkGUCPrefixReserved("online_advisor");
 
@@ -312,7 +348,7 @@ _PG_init(void)
 static void AnalyzeNode(QueryDesc *queryDesc, PlanState *planstate);
 
 /**
- * Try to add multicolumn statistics for specified subplans.
+ * Try to add multicolumn statistic for specified subplans.
  */
 static void
 AnalyzeSubPlans(QueryDesc *queryDesc, List *plans)
@@ -328,7 +364,7 @@ AnalyzeSubPlans(QueryDesc *queryDesc, List *plans)
 }
 
 /**
- * Try to add multicolumn statistics for plan subnodes.
+ * Try to add multicolumn statistic for plan subnodes.
  */
 static void
 AnalyzeMemberNodes(QueryDesc *queryDesc, PlanState **planstates, int nsubnodes)
@@ -339,22 +375,28 @@ AnalyzeMemberNodes(QueryDesc *queryDesc, PlanState **planstates, int nsubnodes)
 	}
 }
 
+typedef double (*aggregate_func)(double acc, double val);
+
+static double agg_sum(double acc, double val)
+{
+	return acc + val;
+}
+
+static double agg_max(double acc, double val)
+{
+	return acc > val ? acc : val;
+}
+
+
 /**
  * Check number of filtered records for the qual
  */
 static void
-AnalyzeQual(QueryDesc *queryDesc, PlanState *planstate, List* qual)
+AddProposal(Proposal* prop, QueryDesc *queryDesc, List* qual, double value, size_t min_vars, aggregate_func aggregate)
 {
+	List* rtable = queryDesc->plannedstmt->rtable;
 	List *vars = NULL;
 	ListCell* lc;
-	List* rtable = queryDesc->plannedstmt->rtable;
-
-	/* Cpnsider only clauses filtering more than thrershold */
-	double n_filtered = planstate->instrument->nfiltered1;
-	if (n_filtered < filtered_threshold)
-	{
-		return;
-	}
 
 	/* Extract vars from all quals */
 	foreach (lc, qual)
@@ -371,7 +413,6 @@ AnalyzeQual(QueryDesc *queryDesc, PlanState *planstate, List* qual)
 		ListCell *cell;
 		Index relno = 0;
 		FixedBitmapset colmap;
-		bool has_vars = false;
 		memset(&colmap, 0, sizeof(colmap));
 
 		/* Contruct set of used vars */
@@ -396,7 +437,6 @@ AnalyzeQual(QueryDesc *queryDesc, PlanState *planstate, List* qual)
 						if (rte->rtekind == RTE_RELATION)
 						{
 							fbms_add_member(&colmap, varattno);
-							has_vars = true;
 						}
 					}
 				}
@@ -407,51 +447,70 @@ AnalyzeQual(QueryDesc *queryDesc, PlanState *planstate, List* qual)
 			}
 			vars = foreach_delete_current(vars, cell);
 		}
-		if (has_vars)
+		if (fbms_num_members(&colmap) >= min_vars)
 		{
 			RangeTblEntry *rte = rt_fetch(relno, rtable);
 			Oid relid = rte->relid;
 			bool found = false;
 			int i;
 			int min = -1;
-			for (i = 0; i < state->n_clauses; i++)
+			for (i = 0; i < prop->n_clauses; i++)
 			{
-				if (state->filter_clauses[i].relid == relid &&
-					state->filter_clauses[i].dbid == MyDatabaseId &&
-					memcmp(&state->filter_clauses[i].key_set, &colmap, sizeof(colmap)) == 0)
+				if (prop->filter_clauses[i].relid == relid &&
+					prop->filter_clauses[i].dbid == MyDatabaseId &&
+					memcmp(&prop->filter_clauses[i].key_set, &colmap, sizeof(colmap)) == 0)
 				{
 					found = true;
 					break;
 				}
-				if (min < 0 || state->filter_clauses[i].n_filtered < state->filter_clauses[min].n_filtered)
+				if (min < 0 || prop->filter_clauses[i].agg < prop->filter_clauses[min].agg)
 				{
 					min = i;
 				}
 			}
 			if (!found)
 			{
-				if (i == max_indexes)
+				if (i == max_proposals)
 				{
-					/* Replace clause with smallest number of fitlered records */
+					/* Replace clause with smallest aggregate value */
 					Assert(min != -1);
 					i = min;
 				}
 				else
 				{
-					state->n_clauses += 1;
+					prop->n_clauses += 1;
 				}
-				memcpy(&state->filter_clauses[i].key_set, &colmap, sizeof(colmap));
-				state->filter_clauses[i].relid = relid;
-				state->filter_clauses[i].dbid = MyDatabaseId;
-				state->filter_clauses[i].n_filtered = 0;
-				state->filter_clauses[i].n_calls = 0;
-				state->filter_clauses[i].elapsed = 0;
+				memcpy(&prop->filter_clauses[i].key_set, &colmap, sizeof(colmap));
+				prop->filter_clauses[i].relid = relid;
+				prop->filter_clauses[i].dbid = MyDatabaseId;
+				prop->filter_clauses[i].agg = 0.0;
+				prop->filter_clauses[i].n_calls = 0;
+				prop->filter_clauses[i].elapsed = 0.0;
 			}
-			state->filter_clauses[i].n_filtered += n_filtered;
-			state->filter_clauses[i].n_calls += 1;
-			state->filter_clauses[i].elapsed += queryDesc->totaltime->total;
+			prop->filter_clauses[i].agg = aggregate(prop->filter_clauses[i].agg, value);
+			prop->filter_clauses[i].n_calls += 1;
+			prop->filter_clauses[i].elapsed += queryDesc->totaltime->total;
 		}
 	}
+}
+
+/**
+ * Propose multicolumn statistic for quals with bug misestimation
+ */
+static void
+ProposeMultiColumnStatisticForQual(QueryDesc *queryDesc, PlanState *planstate, List* qual)
+{
+	double misestimation = planstate->instrument->tuplecount / planstate->plan->plan_rows;
+	AddProposal(&state->statistics, queryDesc, qual, misestimation, 2, agg_max);
+}
+
+/**
+ * Check number of filtered records for the qual
+ */
+static void
+ProposeIndexForQual(QueryDesc *queryDesc, PlanState *planstate, List* qual)
+{
+	AddProposal(&state->indexes, queryDesc, qual, planstate->instrument->nfiltered1, 1, agg_sum);
 }
 
 /**
@@ -461,11 +520,55 @@ static void
 AnalyzeNode(QueryDesc *queryDesc, PlanState *planstate)
 {
 	Plan	   *plan = planstate->plan;
-
-	if (do_instrumentation && plan->qual)
+	double rows = planstate->instrument->tuplecount;
+    /*	planstate->instrument->ntuples / planstate->instrument->nloops; ??? */
+	if (misestimation_threshold != 0 &&
+		plan->plan_rows != 0 &&
+		rows / plan->plan_rows >= misestimation_threshold &&
+		(min_rows == 0 || rows >= min_rows))
 	{
-		Assert(planstate->instrument);
-		AnalyzeQual(queryDesc, planstate, plan->qual);
+		elog(LOG, "[online-advisor]: Misestimation %f for statement \"%s\", node \"%s\": %f expected, %f actual",
+			 rows / plan->plan_rows,
+			 queryDesc->sourceText, nodeToString(plan),
+			 plan->plan_rows, rows);
+		/* quals, sort keys, etc */
+		switch (nodeTag(plan))
+		{
+			case T_IndexScan:
+				ProposeMultiColumnStatisticForQual(queryDesc, planstate, ((IndexScan *) plan)->indexqualorig);
+				break;
+			case T_IndexOnlyScan:
+				ProposeMultiColumnStatisticForQual(queryDesc, planstate, ((IndexOnlyScan *) plan)->indexqual);
+				break;
+			case T_BitmapIndexScan:
+				ProposeMultiColumnStatisticForQual(queryDesc, planstate, ((BitmapIndexScan *) plan)->indexqualorig);
+				break;
+			case T_NestLoop:
+				ProposeMultiColumnStatisticForQual(queryDesc, planstate, ((NestLoop *) plan)->join.joinqual);
+				break;
+			case T_MergeJoin:
+				ProposeMultiColumnStatisticForQual(queryDesc, planstate, ((MergeJoin *) plan)->mergeclauses);
+				ProposeMultiColumnStatisticForQual(queryDesc, planstate, ((MergeJoin *) plan)->join.joinqual);
+				break;
+			case T_HashJoin:
+				ProposeMultiColumnStatisticForQual(queryDesc, planstate, ((HashJoin *) plan)->hashclauses);
+				ProposeMultiColumnStatisticForQual(queryDesc, planstate, ((HashJoin *) plan)->join.joinqual);
+				break;
+			default:
+				break;
+		}
+		ProposeMultiColumnStatisticForQual(queryDesc, planstate, plan->qual);
+	}
+	if (filtered_threshold != 0 && plan->qual)
+	{
+		double n_filtered = planstate->instrument->nfiltered1;
+		/* Consider only clauses filtering more than threshold */
+		if (n_filtered >= filtered_threshold)
+		{
+			elog(LOG, "[online-advisor]: Too many filtered rows %f for statement \"%s\", node \"%s\"",
+				 n_filtered, queryDesc->sourceText, nodeToString(plan));
+			ProposeIndexForQual(queryDesc, planstate, plan->qual);
+		}
 	}
 	/* initPlan-s */
 	if (planstate->initPlan)
@@ -559,11 +662,14 @@ advisor_ExecutorEnd(QueryDesc *queryDesc)
 		InstrEndLoop(queryDesc->totaltime);
 
 		/*
-		 * Update information about index clauses under spinlock */
-		SpinLockAcquire(&state->spinlock);
-		AnalyzeNode(queryDesc, queryDesc->planstate);
-		SpinLockRelease(&state->spinlock);
-
+		 * Update information about clauses under spinlock
+		 */
+		if (do_instrumentation)
+		{
+			SpinLockAcquire(&state->spinlock);
+			AnalyzeNode(queryDesc, queryDesc->planstate);
+			SpinLockRelease(&state->spinlock);
+		}
 		MemoryContextSwitchTo(oldcxt);
 	}
 
@@ -579,6 +685,24 @@ compare_number_of_keys(void const* a, void const* b)
 {
 	return fbms_num_members(&((FilterClause*)a)->key_set) - fbms_num_members(&((FilterClause*)b)->key_set);
 }
+
+typedef char* (*create_statement_func)(char const* schema, char const* table, char const* columns);
+
+static char*
+create_index(char const* schema, char const* table, char const* columns)
+{
+	return psprintf("CREATE INDEX ON %s.%s(%s)", schema, table, columns);
+}
+
+static char*
+create_statistics(char const* schema, char const* table, char const* columns)
+{
+	return psprintf("CREATE STATISTICS ON %s FROM %s.%s", columns, schema, table);
+}
+
+
+
+typedef bool (*check_if_exists_func)(Oid relid, FixedBitmapset const* keys);
 
 static bool
 check_if_index_exists(Oid relid, FixedBitmapset const* keys)
@@ -604,12 +728,49 @@ check_if_index_exists(Oid relid, FixedBitmapset const* keys)
 	rc = SPI_execute(buf.data, true, 0);
 	if (rc != SPI_OK_SELECT)
 	{
-		elog(LOG, "Select failed with status %d", rc);
+		elog(LOG, "[online-advisor]: Select failed with status %d", rc);
 	}
 	else if (SPI_processed)
 	{
 		char* indname = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-		elog(LOG, "Index %s already exists", indname);
+		elog(LOG, "[online-advisor]: Index %s already exists", indname);
+		found = true;
+	}
+	SPI_finish();
+	pfree(buf.data);
+	return found;
+}
+
+static bool
+check_if_statistic_exists(Oid relid, FixedBitmapset const* keys)
+{
+	StringInfoData buf;
+	int attno  = -1;
+	char sep = '{';
+	bool found = false;
+	int rc;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "select stxname from pg_statistic_ext where stxrelid=%d and '", relid);
+
+	while ((attno = fbms_next_member(keys, attno)) >= 0)
+	{
+		appendStringInfoChar(&buf, sep);
+		appendStringInfo(&buf, "%d", attno);
+		sep = ',';
+	}
+	appendStringInfoString(&buf, "}'::smallint[] <@ stxkeys::smallint[]");
+
+	SPI_connect();
+	rc = SPI_execute(buf.data, true, 0);
+	if (rc != SPI_OK_SELECT)
+	{
+		elog(LOG, "[online-advisor]: Select failed with status %d", rc);
+	}
+	else if (SPI_processed)
+	{
+		char* stxname = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+		elog(LOG, "[online-advisor]: Statistic %s already exists", stxname);
 		found = true;
 	}
 	SPI_finish();
@@ -631,10 +792,8 @@ typedef struct
 
 #define ONLINE_ADVISOR_NATTRS 4
 
-PG_FUNCTION_INFO_V1(propose_indexes);
-
-Datum
-propose_indexes(PG_FUNCTION_ARGS)
+static Datum
+get_proposals(PG_FUNCTION_ARGS, Proposal* prop, create_statement_func create_statement, check_if_exists_func check_if_exists, aggregate_func aggregate)
 {
 	FuncCallContext *funcctx;
 	Datum		result;
@@ -665,12 +824,12 @@ propose_indexes(PG_FUNCTION_ARGS)
 		{
 			/* Copy content from shared memory under spinlock */
 			SpinLockAcquire(&state->spinlock);
-			n_clauses = state->n_clauses;
+			n_clauses = prop->n_clauses;
 			fctx->clauses = (FilterClause*) palloc0(n_clauses*sizeof(FilterClause));
-			memcpy(fctx->clauses, state->filter_clauses, n_clauses*sizeof(FilterClause));
+			memcpy(fctx->clauses, prop->filter_clauses, n_clauses*sizeof(FilterClause));
 			if (reset)
 			{
-				state->n_clauses = 0;
+				prop->n_clauses = 0;
 			}
 			SpinLockRelease(&state->spinlock);
 
@@ -703,15 +862,12 @@ propose_indexes(PG_FUNCTION_ARGS)
 			bool	nulls[ONLINE_ADVISOR_NATTRS] = { false, false, false, false };
 			Oid 	relid = fctx->clauses[i].relid;
 			StringInfoData buf;
-			char sep = '(';
+			char sep = ' ';
 			int attno  = -1;
 			FixedBitmapset* keys = &fctx->clauses[i].key_set;
 			size_t k = i;
 
 			initStringInfo(&buf);
-			appendStringInfo(&buf, "CREATE INDEX ON %s.%s",
-							 get_namespace_name(get_rel_namespace(relid)),
-							 get_rel_name(relid));
 
 			/* Append all attributes (order doesn't matter) */
 			while ((attno = fbms_next_member(keys, attno)) >= 0)
@@ -743,7 +899,7 @@ propose_indexes(PG_FUNCTION_ARGS)
 						}
 						keys = &fctx->clauses[j].key_set;
 						fctx->visited[j] = true;
-						fctx->clauses[i].n_filtered += fctx->clauses[j].n_filtered;
+						fctx->clauses[i].agg = aggregate(fctx->clauses[i].agg, fctx->clauses[j].agg);
 						fctx->clauses[i].n_calls += fctx->clauses[j].n_calls;
 						fctx->clauses[i].elapsed += fctx->clauses[j].elapsed;
 						k = j;
@@ -751,16 +907,17 @@ propose_indexes(PG_FUNCTION_ARGS)
 				}
 			}
 			fctx->curpos = i+1;
-			if (check_if_index_exists(relid, &fctx->clauses[k].key_set))
+			if (check_if_exists(relid, &fctx->clauses[k].key_set))
 			{
 				pfree(buf.data);
 				continue;
 			}
-			appendStringInfoChar(&buf, ')');
-			values[0] = Float8GetDatum(state->filter_clauses[i].n_filtered);
-			values[1] = UInt64GetDatum(state->filter_clauses[i].n_calls);
-			values[2] = Float8GetDatum(state->filter_clauses[i].elapsed);
-			values[3] = CStringGetTextDatum(buf.data);
+			values[0] = Float8GetDatum(fctx->clauses[i].agg);
+			values[1] = UInt64GetDatum(fctx->clauses[i].n_calls);
+			values[2] = Float8GetDatum(fctx->clauses[i].elapsed);
+			values[3] = CStringGetTextDatum(create_statement(get_namespace_name(get_rel_namespace(relid)),
+															 get_rel_name(relid),
+															 buf.data+1)); /* skip first space */
 			pfree(buf.data);
 
 			/* Build and return the tuple. */
@@ -771,3 +928,20 @@ propose_indexes(PG_FUNCTION_ARGS)
 	}
 	SRF_RETURN_DONE(funcctx);
 }
+
+PG_FUNCTION_INFO_V1(propose_indexes);
+PG_FUNCTION_INFO_V1(propose_statistics);
+
+Datum
+propose_indexes(PG_FUNCTION_ARGS)
+{
+	return get_proposals(fcinfo, &state->indexes, create_index, check_if_index_exists, agg_sum);
+}
+
+Datum
+propose_statistics(PG_FUNCTION_ARGS)
+{
+	return get_proposals(fcinfo, &state->statistics, create_statistics, check_if_statistic_exists, agg_max);
+}
+
+
