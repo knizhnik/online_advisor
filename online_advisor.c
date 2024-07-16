@@ -521,7 +521,6 @@ AnalyzeNode(QueryDesc *queryDesc, PlanState *planstate)
 {
 	Plan	   *plan = planstate->plan;
 	double rows = planstate->instrument->tuplecount;
-    /*	planstate->instrument->ntuples / planstate->instrument->nloops; ??? */
 	if (misestimation_threshold != 0 &&
 		plan->plan_rows != 0 &&
 		rows / plan->plan_rows >= misestimation_threshold &&
