@@ -29,6 +29,10 @@ vacuum analyze xyz;
 select count(*) from xyz where x=1 and y=1 and z=1;
 select misestimation,n_called,create_statistics from proposed_statistics;
 
+-- check getting executors statistic: here we can check only number of calls to provide deterministic output
+select total_queries from get_executor_stats(true);
+select total_queries from get_executor_stats();
+
 -- check work with multiple databases
 create database somedb;
 \c somedb

@@ -6,11 +6,12 @@ which can increase speed of your queries.
 ### How it works:
 `online_advisor` use mostly the same technique as standard Postgres extension `auto_explain`.
 It sets up executor hook to enable instrumentation and analyze instrumentation results at the end of query execution.
-Right now `online_advisor` detects two patters:
+Right now `online_advisor` detects three patters:
 1. Quals filtering large number of records. It is assumed that such quals can be replaced with index scan.
 2. Misestimated clauses: nodes with number of estimated rows significantly smaller than actual number of returned rows.
-It usually caused by lack/inaccuracy of statistics or lack of knowledge about correlation between columxns. It can be addressed
+It usually caused by lack/inaccuracy of statistics or lack of knowledge about correlation between columns. It can be addressed
 by creating extended (multicolumn) statistics.
+3. Large planning overhead caused by not using prepared statements for simple queries.
 
 ### What it does:
 Create index proposals:
@@ -26,6 +27,10 @@ Create extended statistic proposals:
 3. Proposes create extended statistics statement fort this columns.
 4. Checks if such statistics already available.
 
+Prepared statements:
+1. Calculate planning and execution time (you can enable logging of them for each query) and planning overhead (planning_time/execution_time)
+2. Accumulate maximal/total planning/execution time and maximal/average planning overhead.
+3. Log statements which planning overhead exceeds `prepare_threshold`
 
 ### What it doesn't do:
 1. Checks operators used in the predicate. For example, query predicate `x > 10 and y < 100` can not be optimized using compound index on (x,y). But right now `online_advisor` doesn't detect it.
@@ -33,6 +38,7 @@ Create extended statistic proposals:
 3. Estimate effect of adding suggested index. There is another extension - hypothetical indexes https://github.com/HypoPG/hypopg# which allows to do it. It can be used in conjunction with `online_advisor`.
 4. `online_advisor` doesn't create indexes or extended statistics itself. It just makes recommendations to create them. Please also notice that
 to make optimizer use created indexes or statistics, you should better explicitly call `vacuum analyze` for this table.
+4. Generalize queries (exclude constants) and maintain list of queries which should be prepared
 
 ### Requirements:
 1. `online_advisor` should be included in `preload_shared_libraries` list.
@@ -44,7 +50,11 @@ to make optimizer use created indexes or statistics, you should better explicitl
 - "online_advisor.misestimation_threshold": threshold for actual/estimated #rows ratio (default 10)
 - "online_advisor.min_rows": minimal number of returns nodes for which misestimation is considered (default 1000)
 - "online_advisor.max_proposals": maximal number of tracked clauses and so number of proposed indexes/statistics (default 1000).
-- "online_advisor.do_instrumentation": allows to switch on/off instrumentation and so collecting of data by `online_advisor`.
+- "online_advisor.do_instrumentation": allows to switch on/off instrumentation and so collecting of data by `online_advisor` (default on).
+- "online_advisor.log_duration": log planning/execution time for each query (default off).
+- "online_advisor.prepare_threshold": minimal planning/execution time relation for suggesting use of prepared statements (default 1.0).
+
+
 
 ### Results:
 1. Results can be obtained through `proposed_indexes` and `proposed_statistics` views having the following columns:
@@ -73,6 +83,19 @@ can use one compound index (x,y). But queries `select * from T where x=? and y=?
 which is used by `proposed_indexes` view. You can call it directly with `combine=false` to report
 information separately for each set of columns and prevent `online_advisor` from
 covering several cases using compound index.
+4. Query planning and execution time can be obtained through `get_executor_stats(reset boolean default false)` function returning `executor_stats` type:
+```
+CREATE TYPE executor_stats as (
+    total_execution_time  float8,
+	max_execution_time    float8,
+	total_planning_time   float8,
+	max_planning_time     float8,
+	avg_planning_overhead float8,
+	max_planning_overhead float8,
+	total_queries         bigint
+);
+```
+You should consider use of prepared statements if `avg_planning_overhead` is greater than 1.
 
 
 

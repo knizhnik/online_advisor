@@ -21,6 +21,7 @@
 #include "access/skey.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "catalog/pg_namespace.h"
 #include "commands/defrem.h"
 #include "executor/instrument.h"
 #include "executor/spi.h"
@@ -51,10 +52,12 @@ PG_MODULE_MAGIC;
 
 /* GUC variables */
 static bool do_instrumentation = false;
-static int  filtered_threshold = 1000;
+static bool log_time = false;
 static int  max_proposals = 1000;
+static double filtered_threshold = 1000;
 static double misestimation_threshold = 10.0;
 static double min_rows = 1000;
+static double prepare_threshold = 1.0;
 
 /* Saved hook values in case of unload */
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
@@ -66,9 +69,9 @@ static shmem_request_hook_type prev_shmem_request_hook = NULL;
 
 /*
  * online_advisor maintains bitmapset in shared memory,
- * so better to make them fixed size. Size of bitmaopset determines
- * maximal number of attributes online_advise can handle.
- * 128 seems tp be larger enough.
+ * so better to make them fixed size. Size of bitmapset determines
+ * maximal number of attributes online_advisor can handle.
+ * 128 seems to be larger enough.
  */
 #define FIXED_SET_SIZE 128 /* must be power of 2 */
 #define FIXED_SET_WORDS (FIXED_SET_SIZE/BITS_PER_BITMAPWORD)
@@ -189,6 +192,13 @@ typedef struct
 	slock_t			spinlock; /* Spinlock to synchronize access */
 	Proposal        indexes;    /* index proposals */
 	Proposal        statistics; /* extended statistics proposals */
+	double			max_planning_overhead;
+	double			total_planning_overhead;
+	double			max_planning_time;
+	double			total_planning_time;
+	double			max_execution_time;
+	double			total_execution_time;
+	uint64          total_queries;
 } AdvisorState;
 
 AdvisorState* state;
@@ -237,10 +247,9 @@ advisor_shmem_startup(void)
 							&found);
 	if (!found)
 	{
+		memset(state, 0, sizeof(*state));
 		state->indexes.filter_clauses = (FilterClause*)(state + 1);
-		state->indexes.n_clauses = 0;
 		state->statistics.filter_clauses = state->indexes.filter_clauses + max_proposals;
-		state->statistics.n_clauses = 0;
 		SpinLockInit(&state->spinlock);
 	}
 	LWLockRelease(AddinShmemInitLock);
@@ -265,12 +274,12 @@ _PG_init(void)
 		return;
 
 	/* Define custom GUC variables. */
-	DefineCustomIntVariable("online_advisor.filtered_threshold",
+	DefineCustomRealVariable("online_advisor.filtered_threshold",
 							"Minimum number of filtered records which triggers index suggestion.",
 							"Zero disdable this rule",
 							&filtered_threshold,
-							1000,
-							1, INT_MAX,
+							1000.0,
+							0.0, INT_MAX,
 							PGC_USERSET,
 							0,
 							NULL,
@@ -318,6 +327,30 @@ _PG_init(void)
 							 "Zero disables this rule",
 							 &min_rows,
 							 1000.0,
+							 0.0,
+							 INT_MAX,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("online_advisor.log_duration",
+							 "Log planning/exection time of statements.",
+							 NULL,
+							 &log_time,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomRealVariable("online_advisor.prepare_threshold",
+							 "Minimal planning/execution time relation for suggesting use of prepared statements",
+							 "Zero disables this rule",
+							 &prepare_threshold,
+							 1.0,
 							 0.0,
 							 INT_MAX,
 							 PGC_USERSET,
@@ -613,6 +646,26 @@ AnalyzeNode(QueryDesc *queryDesc, PlanState *planstate)
 	}
 }
 
+static double compile_time;
+static bool   executor_stats_called;
+static bool   do_analyze;
+
+static bool
+is_system_query(QueryDesc *queryDesc)
+{
+	List* rtable = queryDesc->plannedstmt->rtable;
+	ListCell* lc;
+
+	/* Extract vars from all quals */
+	foreach (lc, rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry*)lfirst(lc);
+		Oid relid = rte->relid;
+		if (get_rel_namespace(relid) == PG_CATALOG_NAMESPACE)
+			return true;
+	}
+	return false;
+}
 
 /*
  * ExecutorStart hook: start up logging if needed
@@ -620,9 +673,11 @@ AnalyzeNode(QueryDesc *queryDesc, PlanState *planstate)
 static void
 advisor_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
-	if (do_instrumentation)
+	do_analyze = do_instrumentation && !is_system_query(queryDesc);
+	if (do_analyze)
 	{
 		queryDesc->instrument_options |= INSTRUMENT_TIMER;
+		compile_time = (double)(GetCurrentTimestamp() - GetCurrentStatementStartTimestamp()) / USECS_PER_SEC;
 	}
 
 	if (prev_ExecutorStart)
@@ -630,11 +685,12 @@ advisor_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	else
 		standard_ExecutorStart(queryDesc, eflags);
 
-	if (do_instrumentation)
+	if (do_analyze)
 	{
 		MemoryContext oldcxt = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
 		queryDesc->totaltime = InstrAlloc(1, INSTRUMENT_TIMER, false);
 		MemoryContextSwitchTo(oldcxt);
+		executor_stats_called = false;
 	}
 }
 
@@ -644,9 +700,10 @@ advisor_ExecutorStart(QueryDesc *queryDesc, int eflags)
 static void
 advisor_ExecutorEnd(QueryDesc *queryDesc)
 {
-	if (queryDesc->totaltime)
+	if (do_analyze)
 	{
 		MemoryContext oldcxt;
+		Assert(queryDesc->totaltime);
 
 		/*
 		 * Make sure we operate in the per-query context, so any cruft will be
@@ -663,11 +720,48 @@ advisor_ExecutorEnd(QueryDesc *queryDesc)
 		/*
 		 * Update information about clauses under spinlock
 		 */
-		if (do_instrumentation)
+		if (!executor_stats_called) /* avoid self-inspection */
 		{
+			double execute_time = queryDesc->totaltime->total;
+			double planning_overhead = compile_time / execute_time;
+
 			SpinLockAcquire(&state->spinlock);
 			AnalyzeNode(queryDesc, queryDesc->planstate);
+
+			state->total_execution_time += execute_time;
+			state->total_planning_time += compile_time;
+
+			if (state->max_execution_time < execute_time)
+				state->max_execution_time = execute_time;
+
+			if (state->max_planning_time < compile_time)
+				state->max_planning_time = compile_time;
+
+			state->total_queries += 1;
+
+			if (state->max_planning_overhead < planning_overhead)
+				state->max_planning_overhead = planning_overhead;
+			state->total_planning_overhead += planning_overhead;
+
 			SpinLockRelease(&state->spinlock);
+
+			if (log_time)
+			{
+				elog(LOG, "[online-advisor]: Statement \"%s\" planning time %f, execution time %f",
+					 queryDesc->sourceText,
+					 compile_time,
+					 execute_time);
+			}
+			if (prepare_threshold != 0
+				&& planning_overhead > prepare_threshold
+				&& queryDesc->params == NULL) /* ognore prepared statements */
+			{
+				elog(LOG, "[online-advisor]: Consider preparing statement \"%s\" because of it relatively large planning time %f comparing to execution time %f: overhead is %f",
+					 queryDesc->sourceText,
+					 compile_time,
+					 execute_time,
+					 planning_overhead);
+			}
 		}
 		MemoryContextSwitchTo(oldcxt);
 	}
@@ -789,7 +883,7 @@ typedef struct
 	FilterClause*	clauses;
 } FunctionCallContext;
 
-#define ONLINE_ADVISOR_NATTRS 4
+#define PROPOSAL_NATTRS 4
 
 static Datum
 get_proposals(PG_FUNCTION_ARGS, Proposal* prop, create_statement_func create_statement, check_if_exists_func check_if_exists, aggregate_func aggregate)
@@ -857,8 +951,8 @@ get_proposals(PG_FUNCTION_ARGS, Proposal* prop, create_statement_func create_sta
 	{
 		if (fctx->clauses[i].dbid == MyDatabaseId && !fctx->visited[i])
 		{
-			Datum	values[ONLINE_ADVISOR_NATTRS];
-			bool	nulls[ONLINE_ADVISOR_NATTRS] = { false, false, false, false };
+			Datum	values[PROPOSAL_NATTRS];
+			bool	nulls[PROPOSAL_NATTRS] = { false };
 			Oid 	relid = fctx->clauses[i].relid;
 			StringInfoData buf;
 			char sep = ' ';
@@ -944,3 +1038,47 @@ propose_statistics(PG_FUNCTION_ARGS)
 }
 
 
+PG_FUNCTION_INFO_V1(get_executor_stats);
+
+#define EXECUTOR_STATS_NATTRS 7
+
+Datum
+get_executor_stats(PG_FUNCTION_ARGS)
+{
+	HeapTuple	tuple;
+	TupleDesc	tupdesc;
+	bool 		reset = PG_ARGISNULL(0) ? false : PG_GETARG_BOOL(0);
+	Datum		values[EXECUTOR_STATS_NATTRS];
+	bool		nulls[EXECUTOR_STATS_NATTRS] = { false };
+
+	if (!state)
+		PG_RETURN_NULL();
+
+	/* Construct a tuple descriptor for the result rows. */
+	get_call_result_type(fcinfo, NULL, &tupdesc);
+
+	SpinLockAcquire(&state->spinlock);
+	values[0] = Float8GetDatum(state->total_execution_time);
+	values[1] = Float8GetDatum(state->max_execution_time);
+	values[2] = Float8GetDatum(state->total_planning_time);
+	values[3] = Float8GetDatum(state->max_planning_time);
+	values[4] = Float8GetDatum(state->total_queries ? state->total_planning_overhead / state->total_queries : 0.0);
+	values[5] = Float8GetDatum(state->max_planning_overhead);
+	values[6] = UInt64GetDatum(state->total_queries);
+	if (reset)
+	{
+		state->total_execution_time = 0;
+		state->max_execution_time = 0;
+		state->total_planning_time = 0;
+		state->max_planning_time = 0;
+		state->total_planning_overhead = 0;
+		state->max_planning_overhead = 0;
+		state->total_queries = 0;
+	}
+	SpinLockRelease(&state->spinlock);
+
+	executor_stats_called = true;
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}

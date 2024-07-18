@@ -80,6 +80,19 @@ select misestimation,n_called,create_statistics from proposed_statistics;
           1000 |        1 | CREATE STATISTICS ON x,y,z FROM public.xyz
 (1 row)
 
+-- check getting executors statistic: here we can check only number of calls to provide deterministic output
+select total_queries from get_executor_stats(true);
+ total_queries 
+---------------
+            10
+(1 row)
+
+select total_queries from get_executor_stats();
+ total_queries 
+---------------
+             0
+(1 row)
+
 -- check work with multiple databases
 create database somedb;
 \c somedb

@@ -22,3 +22,9 @@ LANGUAGE C PARALLEL SAFE;
 
 create view proposed_statistics as select * from propose_statistics();
 
+CREATE TYPE executor_stats as (total_execution_time float8, max_execution_time float8, total_planning_time float8, max_planning_time float8, avg_planning_overhead float8, max_planning_overhead float8, total_queries bigint);
+
+CREATE FUNCTION get_executor_stats(reset boolean default false)
+RETURNS executor_stats
+AS 'MODULE_PATHNAME', 'get_executor_stats'
+LANGUAGE C PARALLEL SAFE;
