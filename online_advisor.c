@@ -201,9 +201,13 @@ typedef struct
 	uint64          total_queries;
 } AdvisorState;
 
-AdvisorState* state;
+static AdvisorState* state;
 
+#if PG_VERSION_NUM>=180000
+static bool advisor_ExecutorStart(QueryDesc *queryDesc, int eflags);
+#else
 static void advisor_ExecutorStart(QueryDesc *queryDesc, int eflags);
+#endif
 static void advisor_ExecutorEnd(QueryDesc *queryDesc);
 
 static size_t
@@ -533,7 +537,10 @@ AddProposal(Proposal* prop, QueryDesc *queryDesc, List* qual, double value, size
 static void
 ProposeMultiColumnStatisticForQual(QueryDesc *queryDesc, PlanState *planstate, List* qual)
 {
-	double misestimation = planstate->instrument->tuplecount / planstate->plan->plan_rows;
+	/* Avoid division by zero */
+	double misestimation =
+		Max(planstate->instrument->tuplecount / Max(planstate->plan->plan_rows, 1.0),
+			planstate->plan->plan_rows / Max(planstate->instrument->tuplecount, 1.0));
 	AddProposal(&state->statistics, queryDesc, qual, misestimation, 2, agg_max);
 }
 
@@ -670,9 +677,16 @@ is_system_query(QueryDesc *queryDesc)
 /*
  * ExecutorStart hook: start up logging if needed
  */
+#if PG_VERSION_NUM>=180000
+static bool
+advisor_ExecutorStart(QueryDesc *queryDesc, int eflags)
+{
+	bool plan_valid;
+#else
 static void
 advisor_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
+#endif
 	do_analyze = do_instrumentation && !is_system_query(queryDesc);
 	if (do_analyze)
 	{
@@ -680,10 +694,16 @@ advisor_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		compile_time = (double)(GetCurrentTimestamp() - GetCurrentStatementStartTimestamp()) / USECS_PER_SEC;
 	}
 
+#if PG_VERSION_NUM>=180000
+	plan_valid = prev_ExecutorStart
+		? prev_ExecutorStart(queryDesc, eflags)
+		: standard_ExecutorStart(queryDesc, eflags);
+#else
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
 		standard_ExecutorStart(queryDesc, eflags);
+#endif
 
 	if (do_analyze)
 	{
@@ -692,6 +712,9 @@ advisor_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		MemoryContextSwitchTo(oldcxt);
 		executor_stats_called = false;
 	}
+#if PG_VERSION_NUM>=180000
+	return plan_valid;
+#endif
 }
 
 /*
