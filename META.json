@@ -1,0 +1,42 @@
+{
+   "name": "online_advisor",
+   "abstract": "An extension suggesting missed indexes or statistics.",
+   "version": "__VERSION__",
+   "maintainer": "Konstantin Knizhnik <kknizhnik@gmail.com>",
+   "license": "postgresql",
+   "release_status": "",
+   "provides": {
+      "online_advisor": {
+         "abstract": "An extension adding hypothetical indexes in PostgreSQL.",
+         "file": "online_advisor.sql",
+         "docfile": "README.md",
+         "version": "__VERSION__"
+      }
+   },
+   "resources": {
+      "bugtracker": {
+         "web": "http://github.com/neondatabase/online_advisor/issues/"
+      },
+      "repository": {
+        "url":  "git://github.com/neondatabase/online_advisor.git",
+        "web":  "http://github.com/neondatabase/online_advisor/",
+        "type": "git"
+      }
+   },
+   "prereqs": {
+       "runtime": {
+           "requires": {
+               "PostgreSQL": "9.4.0"
+           }
+       }
+   },
+   "generated_by": "Konstantin Knizhnik",
+   "meta-spec": {
+      "version": "1.0",
+      "url": "http://pgxn.org/meta/spec.txt"
+   },
+   "tags": [
+      "index",
+      "hypothetical"
+   ]
+}
