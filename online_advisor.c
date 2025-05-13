@@ -79,6 +79,20 @@ static shmem_request_hook_type prev_shmem_request_hook = NULL;
 #define WORDNUM(x)	((x) / BITS_PER_BITMAPWORD)
 #define BITNUM(x)	((x) % BITS_PER_BITMAPWORD)
 
+/* PG14 doesn't define bmw_popcount */
+#ifndef bmw_popcount
+#if BITS_PER_BITMAPWORD == 32
+#define bmw_leftmost_one_pos(w)		pg_leftmost_one_pos32(w)
+#define bmw_rightmost_one_pos(w)	pg_rightmost_one_pos32(w)
+#define bmw_popcount(w)				pg_popcount32(w)
+#else
+#define bmw_leftmost_one_pos(w)		pg_leftmost_one_pos64(w)
+#define bmw_rightmost_one_pos(w)	pg_rightmost_one_pos64(w)
+#define bmw_popcount(w)				pg_popcount64(w)
+#endif
+#endif
+
+
 typedef struct {
 	bitmapword words[FIXED_SET_WORDS];
 } FixedBitmapset;
@@ -150,15 +164,6 @@ fbms_is_member(int mbr, const FixedBitmapset *set)
 	Assert(mbr < FIXED_SET_SIZE);
 	return (set->words[WORDNUM(mbr)] & ((bitmapword)1 << BITNUM(mbr))) != 0;
 }
-
-/* PG14 doesn't define bmw_popcount */
-#ifndef bmw_popcount
-#if BITS_PER_BITMAPWORD == 32
-#define bmw_popcount(w)	pg_popcount32(w)
-#else
-#define bmw_popcount(w)	pg_popcount64(w)
-#endif
-#endif
 
 /*
  * fbms_num_members - count members of set
@@ -807,7 +812,17 @@ advisor_ExecutorEnd(QueryDesc *queryDesc)
 static int
 compare_number_of_keys(void const* a, void const* b)
 {
-	return fbms_num_members(&((FilterClause*)a)->key_set) - fbms_num_members(&((FilterClause*)b)->key_set);
+	FilterClause* c1 = (FilterClause*)a;
+	FilterClause* c2 = (FilterClause*)b;
+	int delta;
+	if (c1->dbid != c2->dbid)
+		return c1->dbid - c2->dbid;
+	if (c1->relid != c2->relid)
+		return c1->relid - c2->relid;
+	delta = fbms_num_members(&c1->key_set) - fbms_num_members(&c2->key_set);
+	if (delta != 0)
+		return delta;
+	return c1->n_calls < c2->n_calls ? -1 : c1->n_calls == c2->n_calls ? 0 : 1;
 }
 
 typedef char* (*create_statement_func)(char const* schema, char const* table, char const* columns);

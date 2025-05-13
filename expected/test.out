@@ -45,8 +45,8 @@ select n_filtered,n_called,create_index from proposed_indexes;
  n_filtered | n_called |          create_index           
 ------------+----------+---------------------------------
       18998 |        2 | CREATE INDEX ON public.t(c1,c2)
-       9999 |        1 | CREATE INDEX ON public.t2(x)
        9999 |        1 | CREATE INDEX ON public.t(c1,c3)
+       9999 |        1 | CREATE INDEX ON public.t2(x)
 (3 rows)
 
 -- check work with multiple tables
@@ -59,8 +59,8 @@ select n_filtered,n_called,create_index from proposed_indexes;
  n_filtered | n_called |          create_index           
 ------------+----------+---------------------------------
       18998 |        2 | CREATE INDEX ON public.t(c1,c2)
-       9999 |        1 | CREATE INDEX ON public.t2(x)
       19998 |        2 | CREATE INDEX ON public.t(c3,c1)
+       9999 |        1 | CREATE INDEX ON public.t2(x)
       10000 |        1 | CREATE INDEX ON public.t2(y)
 (4 rows)
 
