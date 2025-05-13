@@ -151,6 +151,14 @@ fbms_is_member(int mbr, const FixedBitmapset *set)
 	return (set->words[WORDNUM(mbr)] & ((bitmapword)1 << BITNUM(mbr))) != 0;
 }
 
+/* PG14 doesn't define bmw_popcount */
+#ifndef bmw_popcount
+#if BITS_PER_BITMAPWORD == 32
+#define bmw_popcount(w)	pg_popcount32(w)
+#else
+#define bmw_popcount(w)	pg_popcount64(w)
+#endif
+#endif
 
 /*
  * fbms_num_members - count members of set
