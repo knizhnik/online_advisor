@@ -35,6 +35,7 @@
 #include "optimizer/planmain.h"
 #include "parser/parsetree.h"
 #include "port/pg_bitutils.h"
+#include "storage/dsm_registry.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
@@ -62,10 +63,6 @@ static double prepare_threshold = 1.0;
 /* Saved hook values in case of unload */
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
-static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
-#if PG_VERSION_NUM>=150000
-static shmem_request_hook_type prev_shmem_request_hook = NULL;
-#endif
 
 /*
  * online_advisor maintains bitmapset in shared memory,
@@ -212,6 +209,7 @@ typedef struct
 	double			max_execution_time;
 	double			total_execution_time;
 	uint64          total_queries;
+	int             max_proposals; 
 } AdvisorState;
 
 static AdvisorState* state;
@@ -223,55 +221,39 @@ static void advisor_ExecutorStart(QueryDesc *queryDesc, int eflags);
 #endif
 static void advisor_ExecutorEnd(QueryDesc *queryDesc);
 
-static size_t
-advisor_shmem_size(void)
+static void
+advisor_init_state(void *ptr)
 {
-	return sizeof(AdvisorState) + max_proposals*2*sizeof(FilterClause);
+	AdvisorState* state = (AdvisorState*)ptr;
+	memset(state, 0, sizeof(*state));
+	state->max_proposals = max_proposals;
+	state->indexes.filter_clauses = (FilterClause*)(state + 1);
+	state->statistics.filter_clauses = state->indexes.filter_clauses + max_proposals;
+	SpinLockInit(&state->spinlock);
 }
 
-static void
-advisor_shmem_request(void)
+static bool
+advisor_init_shmem(void)
 {
-#if PG_VERSION_NUM>=150000
-	if (prev_shmem_request_hook) {
-		prev_shmem_request_hook();
-    }
-#endif
-
-	/*
-	 * Request additional shared resources.  (These are no-ops if we're not in
-	 * the postmaster process.)  We'll allocate or attach to the shared
-	 * resources in advisor_shmem_startup().
-	 */
-	RequestAddinShmemSpace(advisor_shmem_size());
-}
-
-static void
-advisor_shmem_startup(void)
-{
-	bool found;
-
-	if (prev_shmem_startup_hook)
+	bool found = true;
+	if (state == NULL)
 	{
-		prev_shmem_startup_hook ();
-    }
-	/*
-	 * Create or attach to the shared memory state
-	 */
-	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
-	state = ShmemInitStruct("online_advisor",
-							advisor_shmem_size(),
-							&found);
-	if (!found)
-	{
-		memset(state, 0, sizeof(*state));
-		state->indexes.filter_clauses = (FilterClause*)(state + 1);
-		state->statistics.filter_clauses = state->indexes.filter_clauses + max_proposals;
-		SpinLockInit(&state->spinlock);
+		state = GetNamedDSMSegment("online_advisor",
+								   sizeof(AdvisorState) + max_proposals*2*sizeof(FilterClause),
+								   advisor_init_state,
+								   &found);
 	}
-	LWLockRelease(AddinShmemInitLock);
+	return found;
 }
 
+/*
+ * This GUC can be changed only before initialkizing shared memory
+ */
+static bool
+advisor_check_max_proposals(int *newval, void **extra, GucSource source)
+{
+	return state == NULL || *newval == state->max_proposals;
+}
 
 /*
  * Module load callback
@@ -279,21 +261,10 @@ advisor_shmem_startup(void)
 void
 _PG_init(void)
 {
-	/*
-	 * In order to create our shared memory area, we have to be loaded via
-	 * shared_preload_libraries.  If not, fall out without hooking into any of
-	 * the main system.  (We don't throw error here because it seems useful to
-	 * allow the online_advizor functions to be created even when the
-	 * module isn't active.  The functions must protect themselves against
-	 * being called then, however.)
-	 */
-	if (!process_shared_preload_libraries_in_progress)
-		return;
-
 	/* Define custom GUC variables. */
 	DefineCustomRealVariable("online_advisor.filtered_threshold",
 							"Minimum number of filtered records which triggers index suggestion.",
-							"Zero disdable this rule",
+							"Zero disable this rule",
 							&filtered_threshold,
 							1000.0,
 							0.0, INT_MAX,
@@ -309,9 +280,9 @@ _PG_init(void)
 							&max_proposals,
 							1000,
 							1, INT_MAX,
-							PGC_POSTMASTER,
+							PGC_USERSET,
 							0,
-							NULL,
+							advisor_check_max_proposals,
 							NULL,
 							NULL);
 
@@ -377,16 +348,6 @@ _PG_init(void)
 							 NULL);
 
 	MarkGUCPrefixReserved("online_advisor");
-
-#if PG_VERSION_NUM>=150000
-	prev_shmem_request_hook = shmem_request_hook;
-	shmem_request_hook = advisor_shmem_request;
-#else
-	advisor_shmem_request();
-#endif
-	prev_shmem_startup_hook = shmem_startup_hook;
-	shmem_startup_hook = advisor_shmem_startup;
-
 
 	/* Install hooks. */
 	prev_ExecutorStart = ExecutorStart_hook;
@@ -703,6 +664,7 @@ advisor_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	do_analyze = do_instrumentation && !is_system_query(queryDesc);
 	if (do_analyze)
 	{
+		advisor_init_shmem();
 		queryDesc->instrument_options |= INSTRUMENT_TIMER;
 		compile_time = (double)(GetCurrentTimestamp() - GetCurrentStatementStartTimestamp()) / USECS_PER_SEC;
 	}

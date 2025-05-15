@@ -41,8 +41,9 @@ to make optimizer use created indexes or statistics, you should better explicitl
 4. Generalize queries (exclude constants) and maintain list of queries which should be prepared
 
 ### Requirements:
-1. `online_advisor` should be included in `preload_shared_libraries` list.
-2. You should `create extension `online_advisor` in each database you want to inspect.
+1. You should `create extension `online_advisor` in each database you want to inspect.
+2. To activate online_advisor you need to call any of it's function, for example `get_executor_stats()`.
+3. "max_proposals" can be set only once - prior to activation of online_advisor extension.
 
 ### Tuning:
 `online_advisor` has the following GUCs:
