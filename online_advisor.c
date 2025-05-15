@@ -35,7 +35,9 @@
 #include "optimizer/planmain.h"
 #include "parser/parsetree.h"
 #include "port/pg_bitutils.h"
+#if PG_VERSION_NUM>=170000
 #include "storage/dsm_registry.h"
+#endif
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
