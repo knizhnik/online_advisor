@@ -221,6 +221,12 @@ static void advisor_ExecutorStart(QueryDesc *queryDesc, int eflags);
 #endif
 static void advisor_ExecutorEnd(QueryDesc *queryDesc);
 
+static size_t
+advisor_shmem_size(void)
+{
+	return sizeof(AdvisorState) + max_proposals*2*sizeof(FilterClause);
+}
+
 static void
 advisor_init_state(void *ptr)
 {
@@ -232,6 +238,9 @@ advisor_init_state(void *ptr)
 	SpinLockInit(&state->spinlock);
 }
 
+/* Only PG17 provides GetNamedDSMSegment, for other versions online_advistor needs to be include in preload_shareds_libraries */
+#if PG_VERSION_NUM>=170000
+
 static bool
 advisor_init_shmem(void)
 {
@@ -239,7 +248,7 @@ advisor_init_shmem(void)
 	if (state == NULL)
 	{
 		state = GetNamedDSMSegment("online_advisor",
-								   sizeof(AdvisorState) + max_proposals*2*sizeof(FilterClause),
+								   advisor_shmem_size(),
 								   advisor_init_state,
 								   &found);
 	}
@@ -255,12 +264,74 @@ advisor_check_max_proposals(int *newval, void **extra, GucSource source)
 	return state == NULL || *newval == state->max_proposals;
 }
 
+#else
+
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+#if PG_VERSION_NUM>=150000
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+#endif
+
+static void
+advisor_shmem_request(void)
+{
+#if PG_VERSION_NUM>=150000
+	if (prev_shmem_request_hook) {
+		prev_shmem_request_hook();
+    }
+#endif
+
+	/*
+	 * Request additional shared resources.  (These are no-ops if we're not in
+	 * the postmaster process.)  We'll allocate or attach to the shared
+	 * resources in advisor_shmem_startup().
+	 */
+	RequestAddinShmemSpace(advisor_shmem_size());
+}
+
+static void
+advisor_shmem_startup(void)
+{
+	bool found;
+
+	if (prev_shmem_startup_hook)
+	{
+		prev_shmem_startup_hook ();
+    }
+	/*
+	 * Create or attach to the shared memory state
+	 */
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+	state = ShmemInitStruct("online_advisor",
+							advisor_shmem_size(),
+							&found);
+	if (!found)
+	{
+		advisor_init_state(state);
+	}
+	LWLockRelease(AddinShmemInitLock);
+}
+
+#endif
+
 /*
  * Module load callback
  */
 void
 _PG_init(void)
 {
+#if PG_VERSION_NUM<170000
+	/*
+	 * In order to create our shared memory area, we have to be loaded via
+	 * shared_preload_libraries.  If not, fall out without hooking into any of
+	 * the main system.  (We don't throw error here because it seems useful to
+	 * allow the online_advizor functions to be created even when the
+	 * module isn't active.  The functions must protect themselves against
+	 * being called then, however.)
+	 */
+	if (!process_shared_preload_libraries_in_progress)
+		return;
+#endif
+
 	/* Define custom GUC variables. */
 	DefineCustomRealVariable("online_advisor.filtered_threshold",
 							"Minimum number of filtered records which triggers index suggestion.",
@@ -280,9 +351,15 @@ _PG_init(void)
 							&max_proposals,
 							1000,
 							1, INT_MAX,
+#if PG_VERSION_NUM>=170000
 							PGC_USERSET,
 							0,
 							advisor_check_max_proposals,
+#else
+							PGC_POSTMASTER,
+							0,
+							NULL,
+#endif
 							NULL,
 							NULL);
 
@@ -348,6 +425,17 @@ _PG_init(void)
 							 NULL);
 
 	MarkGUCPrefixReserved("online_advisor");
+
+#if PG_VERSION_NUM<170000
+#if PG_VERSION_NUM>=150000
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = advisor_shmem_request;
+#else
+	advisor_shmem_request();
+#endif
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = advisor_shmem_startup;
+#endif
 
 	/* Install hooks. */
 	prev_ExecutorStart = ExecutorStart_hook;
@@ -664,7 +752,9 @@ advisor_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	do_analyze = do_instrumentation && !is_system_query(queryDesc);
 	if (do_analyze)
 	{
+#if PG_VERSION_NUM>=170000
 		advisor_init_shmem();
+#endif
 		queryDesc->instrument_options |= INSTRUMENT_TIMER;
 		compile_time = (double)(GetCurrentTimestamp() - GetCurrentStatementStartTimestamp()) / USECS_PER_SEC;
 	}
