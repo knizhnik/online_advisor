@@ -240,7 +240,7 @@ advisor_init_state(void *ptr)
 	SpinLockInit(&state->spinlock);
 }
 
-/* Only PG17 provides GetNamedDSMSegment, for other versions online_advistor needs to be include in preload_shareds_libraries */
+/* Only PG17 provides GetNamedDSMSegment, for other versions online_advisor needs to be include in preload_shareds_libraries */
 #if PG_VERSION_NUM>=170000
 
 static bool
@@ -326,7 +326,7 @@ _PG_init(void)
 	 * In order to create our shared memory area, we have to be loaded via
 	 * shared_preload_libraries.  If not, fall out without hooking into any of
 	 * the main system.  (We don't throw error here because it seems useful to
-	 * allow the online_advizor functions to be created even when the
+	 * allow the online_advisor functions to be created even when the
 	 * module isn't active.  The functions must protect themselves against
 	 * being called then, however.)
 	 */
@@ -348,7 +348,7 @@ _PG_init(void)
 							NULL);
 
 	DefineCustomIntVariable("online_advisor.max_proposals",
-							"Maximal number of clauses which are tracked by online_advistor and so number of proposals to create indexes/extended statistics.",
+							"Maximal number of clauses which are tracked by online_advisor and so number of proposals to create indexes/extended statistics.",
 							NULL,
 							&max_proposals,
 							1000,
@@ -1065,7 +1065,11 @@ get_proposals(PG_FUNCTION_ARGS, Proposal* prop, create_statement_func create_sta
 			/* Append all attributes (order doesn't matter) */
 			while ((attno = fbms_next_member(keys, attno)) >= 0)
 			{
-				char* attname = get_attname(relid, attno, false);
+				char* attname = get_attname(relid, attno, true);
+				if (attname == NULL)
+				{
+					goto NextClause;
+				}
 				appendStringInfoChar(&buf, sep);
 				appendStringInfoString(&buf, attname);
 				sep = ',';
@@ -1084,7 +1088,11 @@ get_proposals(PG_FUNCTION_ARGS, Proposal* prop, create_statement_func create_sta
 						{
 							if (!fbms_is_member(attno, keys))
 							{
-								char* attname = get_attname(relid, attno, false);
+								char* attname = get_attname(relid, attno, true);
+								if (attname == NULL)
+								{
+									goto NextClause;
+								}
 								appendStringInfoChar(&buf, sep);
 								appendStringInfoString(&buf, attname);
 								sep = ',';
@@ -1102,6 +1110,7 @@ get_proposals(PG_FUNCTION_ARGS, Proposal* prop, create_statement_func create_sta
 			fctx->curpos = i+1;
 			if (check_if_exists(relid, &fctx->clauses[k].key_set))
 			{
+			  NextClause:
 				pfree(buf.data);
 				continue;
 			}
