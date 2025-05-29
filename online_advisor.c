@@ -70,7 +70,7 @@ static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
  * online_advisor maintains bitmapset in shared memory,
  * so better to make them fixed size. Size of bitmapset determines
  * maximal number of attributes online_advisor can handle.
- * 128 seems to be larger enough.
+ * 128 seems to be large enough.
  */
 #define FIXED_SET_SIZE 128 /* must be power of 2 */
 #define FIXED_SET_WORDS (FIXED_SET_SIZE/BITS_PER_BITMAPWORD)
@@ -253,6 +253,10 @@ advisor_init_shmem(void)
 								   advisor_shmem_size(),
 								   advisor_init_state,
 								   &found);
+		if (state == NULL)
+		{
+			elog(LOG, "[online-advisor]: Failed to get named DSM segment: %m");
+		}
 	}
 	return found;
 }
@@ -1045,7 +1049,7 @@ get_proposals(PG_FUNCTION_ARGS, Proposal* prop, create_statement_func create_sta
 
 	/* Get the saved state */
 	fctx = funcctx->user_fctx;
-	n_clauses =  fctx->n_clauses;
+	n_clauses = fctx->n_clauses;
 
 	for (size_t i = fctx->curpos; i < n_clauses; i++)
 	{
@@ -1056,7 +1060,7 @@ get_proposals(PG_FUNCTION_ARGS, Proposal* prop, create_statement_func create_sta
 			Oid 	relid = fctx->clauses[i].relid;
 			StringInfoData buf;
 			char sep = ' ';
-			int attno  = -1;
+			int attno = -1;
 			FixedBitmapset* keys = &fctx->clauses[i].key_set;
 			size_t k = i;
 
@@ -1082,7 +1086,7 @@ get_proposals(PG_FUNCTION_ARGS, Proposal* prop, create_statement_func create_sta
 						MyDatabaseId == fctx->clauses[j].dbid &&
 						fbms_is_subset(&fctx->clauses[k].key_set, &fctx->clauses[j].key_set))
 					{
-						/* Append extra nattroibutes for compound index */
+						/* Append extra nattributes for compound index */
 						Assert(attno == -1);
 						while ((attno = fbms_next_member(&fctx->clauses[j].key_set, attno)) >= 0)
 						{
