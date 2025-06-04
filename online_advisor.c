@@ -238,8 +238,8 @@ advisor_init_state(void *ptr)
 	memset(state, 0, sizeof(*state));
 	state->indexes.max_proposals = max_index_proposals;
 	state->indexes.clauses_offs = 0;
-	state->indexes.max_proposals = max_stat_proposals;
-	state->indexes.clauses_offs = max_index_proposals;
+	state->statistics.max_proposals = max_stat_proposals;
+	state->statistics.clauses_offs = max_index_proposals;
 	SpinLockInit(&state->spinlock);
 }
 
