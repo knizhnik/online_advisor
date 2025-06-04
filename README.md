@@ -44,14 +44,15 @@ to make optimizer use created indexes or statistics, you should better explicitl
 1. In pg14-16 `online_advisor` should be included in `preload_shared_libraries` list.
 2. You should `create extension `online_advisor` in each database you want to inspect.
 3. To activate online_advisor you need to call any of it's function, for example `get_executor_stats()`.
-4. "max_proposals" can be set only once - prior to activation of online_advisor extension.
+4. "max_index_proposals" and "max_stat_proposals" can be set only once - prior to activation of online_advisor extension.
 
 ### Tuning:
 `online_advisor` has the following GUCs:
 - "online_advisor.filtered_threshold": specifies threshold for number of filtered records (default 1000)
 - "online_advisor.misestimation_threshold": threshold for actual/estimated #rows ratio (default 10)
 - "online_advisor.min_rows": minimal number of returns nodes for which misestimation is considered (default 1000)
-- "online_advisor.max_proposals": maximal number of tracked clauses and so number of proposed indexes/statistics (default 1000).
+- "online_advisor.max_index_proposals": maximal number of tracked clauses to propose index creation (default 1000).
+- "online_advisor.max_stat_proposals": maximal number of tracked clauses to propose extended statistics creation (default 1000).
 - "online_advisor.do_instrumentation": allows to switch on/off instrumentation and so collecting of data by `online_advisor` (default on).
 - "online_advisor.log_duration": log planning/execution time for each query (default off).
 - "online_advisor.prepare_threshold": minimal planning/execution time relation for suggesting use of prepared statements (default 1.0).

@@ -56,7 +56,8 @@ PG_MODULE_MAGIC;
 /* GUC variables */
 static bool do_instrumentation = false;
 static bool log_time = false;
-static int  max_proposals = 1000;
+static int  max_index_proposals = 1000;
+static int  max_stat_proposals = 1000;
 static double filtered_threshold = 1000;
 static double misestimation_threshold = 10.0;
 static double min_rows = 1000;
@@ -195,8 +196,9 @@ typedef struct
 
 typedef struct
 {
-	size_t          n_clauses;
-	FilterClause*   filter_clauses;
+	size_t			n_clauses;
+	size_t			max_proposals;
+	size_t			clauses_offs;
 } Proposal;
 
 typedef struct
@@ -211,7 +213,7 @@ typedef struct
 	double			max_execution_time;
 	double			total_execution_time;
 	uint64          total_queries;
-	int             max_proposals; 
+	FilterClause    filter_clauses[FLEXIBLE_ARRAY_MEMBER];
 } AdvisorState;
 
 static AdvisorState* state;
@@ -226,7 +228,7 @@ static void advisor_ExecutorEnd(QueryDesc *queryDesc);
 static size_t
 advisor_shmem_size(void)
 {
-	return sizeof(AdvisorState) + max_proposals*2*sizeof(FilterClause);
+	return offsetof(AdvisorState, filter_clauses) + (max_stat_proposals + max_index_proposals)*sizeof(FilterClause);
 }
 
 static void
@@ -234,9 +236,10 @@ advisor_init_state(void *ptr)
 {
 	AdvisorState* state = (AdvisorState*)ptr;
 	memset(state, 0, sizeof(*state));
-	state->max_proposals = max_proposals;
-	state->indexes.filter_clauses = (FilterClause*)(state + 1);
-	state->statistics.filter_clauses = state->indexes.filter_clauses + max_proposals;
+	state->indexes.max_proposals = max_index_proposals;
+	state->indexes.clauses_offs = 0;
+	state->indexes.max_proposals = max_stat_proposals;
+	state->indexes.clauses_offs = max_index_proposals;
 	SpinLockInit(&state->spinlock);
 }
 
@@ -262,12 +265,18 @@ advisor_init_shmem(void)
 }
 
 /*
- * This GUC can be changed only before initialkizing shared memory
+ * This GUCs can be changed only before initialkizing shared memory
  */
 static bool
-advisor_check_max_proposals(int *newval, void **extra, GucSource source)
+advisor_check_max_index_proposals(int *newval, void **extra, GucSource source)
 {
-	return state == NULL || *newval == state->max_proposals;
+	return state == NULL || *newval == state->indexes.max_proposals;
+}
+
+static bool
+advisor_check_max_stat_proposals(int *newval, void **extra, GucSource source)
+{
+	return state == NULL || *newval == state->statistics.max_proposals;
 }
 
 #else
@@ -351,16 +360,34 @@ _PG_init(void)
 							NULL,
 							NULL);
 
-	DefineCustomIntVariable("online_advisor.max_proposals",
-							"Maximal number of clauses which are tracked by online_advisor and so number of proposals to create indexes/extended statistics.",
+	DefineCustomIntVariable("online_advisor.max_index_proposals",
+							"Maximal number of clauses which are tracked by online_advisor to propose index creation.",
 							NULL,
-							&max_proposals,
+							&max_index_proposals,
 							1000,
 							1, INT_MAX,
 #if PG_VERSION_NUM>=170000
 							PGC_USERSET,
 							0,
-							advisor_check_max_proposals,
+							advisor_check_max_index_proposals,
+#else
+							PGC_POSTMASTER,
+							0,
+							NULL,
+#endif
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("online_advisor.max_stat_proposals",
+							"Maximal number of clauses which are tracked by online_advisor to propose extended statisticas creation.",
+							NULL,
+							&max_stat_proposals,
+							1000,
+							1, INT_MAX,
+#if PG_VERSION_NUM>=170000
+							PGC_USERSET,
+							0,
+							advisor_check_max_stat_proposals,
 #else
 							PGC_POSTMASTER,
 							0,
@@ -501,6 +528,7 @@ AddProposal(Proposal* prop, QueryDesc *queryDesc, List* qual, double value, size
 {
 	List* rtable = queryDesc->plannedstmt->rtable;
 	List *vars = NULL;
+	FilterClause* filter_clauses = &state->filter_clauses[prop->clauses_offs];
 	ListCell* lc;
 
 	/* Extract vars from all quals */
@@ -561,21 +589,21 @@ AddProposal(Proposal* prop, QueryDesc *queryDesc, List* qual, double value, size
 			int min = -1;
 			for (i = 0; i < prop->n_clauses; i++)
 			{
-				if (prop->filter_clauses[i].relid == relid &&
-					prop->filter_clauses[i].dbid == MyDatabaseId &&
-					memcmp(&prop->filter_clauses[i].key_set, &colmap, sizeof(colmap)) == 0)
+				if (filter_clauses[i].relid == relid &&
+					filter_clauses[i].dbid == MyDatabaseId &&
+					memcmp(&filter_clauses[i].key_set, &colmap, sizeof(colmap)) == 0)
 				{
 					found = true;
 					break;
 				}
-				if (min < 0 || prop->filter_clauses[i].agg < prop->filter_clauses[min].agg)
+				if (min < 0 || filter_clauses[i].agg < filter_clauses[min].agg)
 				{
 					min = i;
 				}
 			}
 			if (!found)
 			{
-				if (i == max_proposals)
+				if (i == prop->max_proposals)
 				{
 					/* Replace clause with smallest aggregate value */
 					Assert(min != -1);
@@ -585,16 +613,16 @@ AddProposal(Proposal* prop, QueryDesc *queryDesc, List* qual, double value, size
 				{
 					prop->n_clauses += 1;
 				}
-				memcpy(&prop->filter_clauses[i].key_set, &colmap, sizeof(colmap));
-				prop->filter_clauses[i].relid = relid;
-				prop->filter_clauses[i].dbid = MyDatabaseId;
-				prop->filter_clauses[i].agg = 0.0;
-				prop->filter_clauses[i].n_calls = 0;
-				prop->filter_clauses[i].elapsed = 0.0;
+				memcpy(&filter_clauses[i].key_set, &colmap, sizeof(colmap));
+				filter_clauses[i].relid = relid;
+				filter_clauses[i].dbid = MyDatabaseId;
+				filter_clauses[i].agg = 0.0;
+				filter_clauses[i].n_calls = 0;
+				filter_clauses[i].elapsed = 0.0;
 			}
-			prop->filter_clauses[i].agg = aggregate(prop->filter_clauses[i].agg, value);
-			prop->filter_clauses[i].n_calls += 1;
-			prop->filter_clauses[i].elapsed += queryDesc->totaltime->total;
+			filter_clauses[i].agg = aggregate(filter_clauses[i].agg, value);
+			filter_clauses[i].n_calls += 1;
+			filter_clauses[i].elapsed += queryDesc->totaltime->total;
 		}
 	}
 }
@@ -794,10 +822,9 @@ advisor_ExecutorStart(QueryDesc *queryDesc, int eflags)
 static void
 advisor_ExecutorEnd(QueryDesc *queryDesc)
 {
-	if (do_analyze)
+	if (do_analyze && queryDesc->totaltime)
 	{
 		MemoryContext oldcxt;
-		Assert(queryDesc->totaltime);
 
 		/*
 		 * Make sure we operate in the per-query context, so any cruft will be
@@ -1023,7 +1050,7 @@ get_proposals(PG_FUNCTION_ARGS, Proposal* prop, create_statement_func create_sta
 			SpinLockAcquire(&state->spinlock);
 			n_clauses = prop->n_clauses;
 			fctx->clauses = (FilterClause*) palloc0(n_clauses*sizeof(FilterClause));
-			memcpy(fctx->clauses, prop->filter_clauses, n_clauses*sizeof(FilterClause));
+			memcpy(fctx->clauses, &state->filter_clauses[prop->clauses_offs], n_clauses*sizeof(FilterClause));
 			if (reset)
 			{
 				prop->n_clauses = 0;
